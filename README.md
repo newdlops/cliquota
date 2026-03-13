@@ -52,7 +52,29 @@
 
 ## 설치 방법
 
-다른 기기에 `cliquota` 폴더를 그대로 옮긴 뒤 아래 명령을 실행합니다.
+GitHub에서 받아 설치하는 방법은 두 가지가 있습니다.
+
+### 1. `git clone`으로 내려받기
+
+가장 권장하는 방식입니다.
+
+```bash
+cd ~/Desktop
+git clone https://github.com/newdlops/cliquota.git
+cd cliquota
+./install.sh
+```
+
+### 2. GitHub ZIP으로 내려받기
+
+GitHub 저장소 페이지에서 `Code` -> `Download ZIP`으로 압축 파일을 받은 뒤 적당한 위치에 풀고 설치합니다.
+
+```bash
+cd ~/Desktop/cliquota
+./install.sh
+```
+
+이미 다른 기기에 `cliquota` 폴더를 직접 복사해 둔 상태여도 같은 방식으로 설치하면 됩니다.
 
 ```bash
 cd ~/Desktop/cliquota
@@ -125,6 +147,29 @@ source ~/.zshrc
 - 기존 `~/.codex/bin/codex-status-pane`
 
 ## 업데이트 방법
+
+설치 후 설정을 갱신하는 방법은 내려받은 방식에 따라 다릅니다.
+
+### 1. GitHub에서 `git clone`으로 설치한 경우
+
+저장소 디렉터리에서 최신 변경을 받은 뒤 설치 스크립트를 다시 실행합니다.
+
+```bash
+cd ~/Desktop/cliquota
+git pull
+./install.sh
+```
+
+### 2. ZIP으로 내려받아 설치한 경우
+
+GitHub에서 최신 ZIP을 다시 받아 기존 폴더를 교체한 뒤 설치 스크립트를 다시 실행합니다.
+
+```bash
+cd ~/Desktop/cliquota
+./install.sh
+```
+
+### 3. 로컬에서 직접 패키지 파일을 수정한 경우
 
 이 패키지 내부 파일을 수정한 뒤 같은 기기에서 다시 설치하면 됩니다.
 
