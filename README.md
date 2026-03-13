@@ -33,7 +33,7 @@
 ## 설치 전 요구 사항
 
 주의:
-현재 이 패키지는 macOS 환경에서만 동작을 보장합니다. `pbcopy`, 현재 `tmux` 동작 검증, Gemini/Codex CLI 사용 패턴 모두 macOS 기준으로 맞춰져 있습니다.
+현재 이 패키지는 macOS 환경에서만 동작을 보장합니다. `pbcopy`, 현재 `tmux` 동작 검증, Gemini/Codex CLI 사용 패턴 모두 macOS 기준으로 맞춰져 있습니다. 특히 IntelliJ 터미널과 함께 쓸 때는 `tmux`가 outer terminal의 alternate screen을 정상적으로 사용할 수 있어야 하므로, 예전처럼 `smcup`/`rmcup`를 강제로 끄는 설정은 포함하지 않습니다.
 
 다음 명령이 설치 대상 기기에 있어야 합니다.
 
@@ -125,6 +125,20 @@ source ~/.zshrc
 - 더블클릭: 단어 복사
 - 트리플클릭: 줄 전체 복사
 - `Enter`: 현재 선택 영역 복사 후 copy-mode 종료
+
+IntelliJ 터미널이나 일부 터미널 앱에서 바깥 스크롤과 tmux 스크롤이 충돌하면 `prefix + m`으로 tmux mouse mode를 끄고, 다시 tmux 기준 스크롤과 복사를 쓰고 싶을 때 같은 키로 다시 켤 수 있습니다.
+
+다만 IntelliJ 터미널에서는 가능하면 IntelliJ 자체 스크롤보다 tmux 스크롤을 우선으로 쓰는 것을 권장합니다. 이 패키지도 그 사용 방식을 기준으로 맞춰져 있습니다. `mouse` 옵션은 tmux의 세션 옵션이므로, IntelliJ에서 붙은 세션에서만 `prefix + m`으로 조정할 수 있습니다.
+
+또한 IntelliJ 터미널과의 충돌을 줄이기 위해 이 패키지는 `terminal-overrides ',*:smcup@:rmcup@'` 같은 설정을 기본 포함하지 않습니다. 그 설정은 outer terminal의 alternate screen까지 막아 IntelliJ 스크롤과 tmux 스크롤이 동시에 보이는 문제를 만들 수 있습니다.
+
+IntelliJ에서 wheel 이벤트가 tmux로 제대로 들어오게 하려면 IntelliJ Terminal 설정의 `Mouse reporting`이 켜져 있어야 합니다. JetBrains 공식 문서:
+
+- https://www.jetbrains.com/help/idea/settings-tools-terminal.html
+
+추가로 IntelliJ 2025.2 이후에는 `Reworked 2025`가 기본 엔진일 수 있는데, tmux와의 호환성과 입력 전달을 우선하면 `Classic` 엔진을 권장합니다. JetBrains 공식 문서 기준으로 `Classic`은 JediTerm 기반의 표준 터미널이며, 사용자 입력이 underlying shell로 직접 전달됩니다.
+
+- https://www.jetbrains.com/help/idea/terminal-emulator.html
 
 클립보드 복사는 `~/.cliquota/bin/copy-text`가 담당하며, 시스템에 맞는 복사 명령을 자동으로 선택합니다.
 
