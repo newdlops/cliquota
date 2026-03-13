@@ -1,0 +1,981 @@
+#!/usr/bin/env node
+
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const sessionsRoot = path.join(os.homedir(), ".codex", "sessions");
+const authFilePath = path.join(os.homedir(), ".codex", "auth.json");
+const configFilePath = path.join(os.homedir(), ".codex", "config.toml");
+const liveRateLimitCachePath = path.join(os.homedir(), ".codex", "rate_limits_live_cache.json");
+const args = process.argv.slice(2);
+const liveRateLimitFreshMs = 4 * 1000;
+const liveRateLimitFallbackMs = 2 * 60 * 1000;
+const rolloutRateLimitFreshMs = 15 * 60 * 1000;
+const appServerTimeoutMs = 3500;
+
+const options = {
+  short: false,
+  json: false,
+  watchSeconds: null,
+  modelName: null,
+  cwd: null,
+  startedAt: null,
+};
+
+for (let i = 0; i < args.length; i += 1) {
+  const arg = args[i];
+  if (arg === "--short") {
+    options.short = true;
+    continue;
+  }
+  if (arg === "--json") {
+    options.json = true;
+    continue;
+  }
+  if (arg === "--watch") {
+    const value = Number(args[i + 1]);
+    if (!Number.isFinite(value) || value <= 0) {
+      console.error("Expected a positive number after --watch");
+      process.exit(1);
+    }
+    options.watchSeconds = value;
+    i += 1;
+    continue;
+  }
+  if (arg === "--model-name") {
+    const value = args[i + 1];
+    if (!value) {
+      console.error("Expected a model name after --model-name");
+      process.exit(1);
+    }
+    options.modelName = value;
+    i += 1;
+    continue;
+  }
+  if (arg === "--cwd") {
+    const value = args[i + 1];
+    if (!value) {
+      console.error("Expected a path after --cwd");
+      process.exit(1);
+    }
+    options.cwd = value;
+    i += 1;
+    continue;
+  }
+  if (arg === "--started-at") {
+    const value = Number(args[i + 1]);
+    if (!Number.isFinite(value) || value <= 0) {
+      console.error("Expected a positive epoch seconds value after --started-at");
+      process.exit(1);
+    }
+    options.startedAt = value;
+    i += 1;
+    continue;
+  }
+
+  console.error(`Unknown argument: ${arg}`);
+  process.exit(1);
+}
+
+function listJsonlFiles(rootDir) {
+  const files = [];
+  const stack = [rootDir];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        let mtimeMs = 0;
+        try {
+          mtimeMs = fs.statSync(fullPath).mtimeMs;
+        } catch {
+          mtimeMs = 0;
+        }
+        files.push({ fullPath, mtimeMs });
+      }
+    }
+  }
+
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return files;
+}
+
+function readLatestChunk(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
+  } catch {
+    return null;
+  }
+
+  try {
+    const { size } = fs.fstatSync(fd);
+    const chunkSize = 64 * 1024;
+    const maxBytes = 512 * 1024;
+    let remaining = size;
+    let collected = "";
+    let totalRead = 0;
+
+    while (remaining > 0 && totalRead < maxBytes) {
+      const start = Math.max(0, remaining - chunkSize);
+      const length = remaining - start;
+      const buffer = Buffer.alloc(length);
+      fs.readSync(fd, buffer, 0, length, start);
+      collected = buffer.toString("utf8") + collected;
+      totalRead += length;
+      remaining = start;
+
+      if (collected.includes('"payload":{"type":"token_count"')) {
+        break;
+      }
+    }
+
+    return collected;
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readInitialChunk(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
+  } catch {
+    return null;
+  }
+
+  try {
+    const { size } = fs.fstatSync(fd);
+    const length = Math.min(size, 64 * 1024);
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, 0);
+    return buffer.toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readSessionMeta(filePath) {
+  const content = readInitialChunk(filePath);
+  if (!content) {
+    return null;
+  }
+
+  const lines = content.split("\n");
+  for (const line of lines) {
+    if (!line.includes('"type":"session_meta"')) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed?.type !== "session_meta") {
+        continue;
+      }
+
+      return {
+        filePath,
+        timestamp: parsed.timestamp ?? null,
+        sessionTimestamp: parsed.payload?.timestamp ?? null,
+        cwd: parsed.payload?.cwd ?? null,
+        sessionId: parsed.payload?.id ?? null,
+      };
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function getPathMatchScore(currentPath, candidatePath) {
+  if (typeof currentPath !== "string" || typeof candidatePath !== "string") {
+    return -1;
+  }
+  if (currentPath === candidatePath || currentPath.startsWith(`${candidatePath}${path.sep}`)) {
+    return candidatePath.length;
+  }
+  if (candidatePath.startsWith(`${currentPath}${path.sep}`)) {
+    return currentPath.length;
+  }
+  return -1;
+}
+
+function parseTimestampMs(value) {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+function isFreshTimestamp(value, maxAgeMs) {
+  const parsedMs = parseTimestampMs(value);
+  if (!Number.isFinite(parsedMs)) {
+    return false;
+  }
+
+  const nowMs = Date.now();
+  return parsedMs >= nowMs - maxAgeMs && parsedMs <= nowMs + 5 * 60 * 1000;
+}
+
+function hasFutureRateLimits(rateLimits) {
+  if (!rateLimits) {
+    return false;
+  }
+
+  const nowEpochSeconds = Date.now() / 1000;
+  const primaryReset = rateLimits?.primary?.resets_at;
+  const secondaryReset = rateLimits?.secondary?.resets_at;
+
+  return (
+    (Number.isFinite(primaryReset) && primaryReset > nowEpochSeconds + 60) ||
+    (Number.isFinite(secondaryReset) && secondaryReset > nowEpochSeconds + 60)
+  );
+}
+
+function normalizeRateLimitWindow(rateLimitWindow) {
+  if (!rateLimitWindow || typeof rateLimitWindow !== "object") {
+    return null;
+  }
+
+  return {
+    window_minutes:
+      rateLimitWindow.window_minutes ??
+      rateLimitWindow.windowDurationMins ??
+      rateLimitWindow.window_duration_mins ??
+      null,
+    used_percent: rateLimitWindow.used_percent ?? rateLimitWindow.usedPercent ?? null,
+    resets_at: rateLimitWindow.resets_at ?? rateLimitWindow.resetsAt ?? null,
+  };
+}
+
+function normalizeRateLimitSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return null;
+  }
+
+  return {
+    limit_id: snapshot.limit_id ?? snapshot.limitId ?? null,
+    limit_name: snapshot.limit_name ?? snapshot.limitName ?? null,
+    primary: normalizeRateLimitWindow(snapshot.primary),
+    secondary: normalizeRateLimitWindow(snapshot.secondary),
+    credits: snapshot.credits ?? null,
+    plan_type: snapshot.plan_type ?? snapshot.planType ?? null,
+  };
+}
+
+function readLatestTokenCountRecords(filePath) {
+  const content = readLatestChunk(filePath);
+  if (!content) {
+    return {
+      latest: null,
+      latestWithValidRateLimits: null,
+    };
+  }
+
+  const lines = content.split("\n");
+  let latest = null;
+  let latestWithValidRateLimits = null;
+
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.includes('"payload":{"type":"token_count"')) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line);
+      if (
+        parsed?.type === "event_msg" &&
+        parsed?.payload?.type === "token_count"
+      ) {
+        const record = {
+          filePath,
+          timestamp: parsed.timestamp,
+          info: parsed.payload.info ?? {},
+          rateLimits: normalizeRateLimitSnapshot(parsed.payload.rate_limits ?? null),
+        };
+
+        if (!latest) {
+          latest = record;
+        }
+        if (
+          !latestWithValidRateLimits &&
+          isFreshTimestamp(record.timestamp, rolloutRateLimitFreshMs) &&
+          hasFutureRateLimits(record.rateLimits)
+        ) {
+          latestWithValidRateLimits = record;
+        }
+        if (latest && latestWithValidRateLimits) {
+          break;
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return {
+    latest,
+    latestWithValidRateLimits,
+  };
+}
+
+function getNewerRecord(left, right) {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+
+  const leftTime = Date.parse(left.timestamp);
+  const rightTime = Date.parse(right.timestamp);
+
+  if (!Number.isFinite(leftTime)) {
+    return right;
+  }
+  if (!Number.isFinite(rightTime)) {
+    return left;
+  }
+
+  return leftTime >= rightTime ? left : right;
+}
+
+function compareFileCandidates(left, right) {
+  if (!left) {
+    return -1;
+  }
+  if (!right) {
+    return 1;
+  }
+
+  if (left.pathScore !== right.pathScore) {
+    return left.pathScore - right.pathScore;
+  }
+  if (left.startedBucket !== right.startedBucket) {
+    return left.startedBucket - right.startedBucket;
+  }
+  if (left.startedDiffMs !== right.startedDiffMs) {
+    return right.startedDiffMs - left.startedDiffMs;
+  }
+  if (left.sessionTimestampMs !== right.sessionTimestampMs) {
+    return left.sessionTimestampMs - right.sessionTimestampMs;
+  }
+  return left.mtimeMs - right.mtimeMs;
+}
+
+function pickTargetFile(files) {
+  if (!options.cwd && !Number.isFinite(options.startedAt)) {
+    return null;
+  }
+
+  let bestCandidate = null;
+
+  for (const file of files) {
+    const meta = readSessionMeta(file.fullPath);
+    if (!meta) {
+      continue;
+    }
+
+    const pathScore = options.cwd ? getPathMatchScore(options.cwd, meta.cwd) : 0;
+    if (options.cwd && pathScore < 0) {
+      continue;
+    }
+
+    const sessionTimestampMs = parseTimestampMs(meta.sessionTimestamp ?? meta.timestamp);
+    let startedBucket = 1;
+    let startedDiffMs = Number.POSITIVE_INFINITY;
+
+    if (Number.isFinite(options.startedAt) && Number.isFinite(sessionTimestampMs)) {
+      startedDiffMs = Math.abs(sessionTimestampMs - options.startedAt * 1000);
+      if (
+        sessionTimestampMs >= (options.startedAt - 5 * 60) * 1000 &&
+        sessionTimestampMs <= (options.startedAt + 30 * 60) * 1000
+      ) {
+        startedBucket = 3;
+      } else if (startedDiffMs <= 2 * 60 * 60 * 1000) {
+        startedBucket = 2;
+      } else {
+        startedBucket = 1;
+      }
+    } else if (!Number.isFinite(options.startedAt)) {
+      startedBucket = 2;
+      startedDiffMs = 0;
+    }
+
+    const candidate = {
+      fullPath: file.fullPath,
+      mtimeMs: file.mtimeMs,
+      pathScore,
+      startedBucket,
+      startedDiffMs,
+      sessionTimestampMs: Number.isFinite(sessionTimestampMs) ? sessionTimestampMs : 0,
+    };
+
+    if (compareFileCandidates(candidate, bestCandidate) > 0) {
+      bestCandidate = candidate;
+    }
+  }
+
+  return bestCandidate;
+}
+
+function findLatestRecords() {
+  const files = listJsonlFiles(sessionsRoot).slice(0, 100);
+  const targetFile = pickTargetFile(files);
+  let latestGlobalInfoRecord = null;
+  let latestRateLimitRecord = null;
+  let targetInfoRecord = null;
+
+  for (const file of files) {
+    const records = readLatestTokenCountRecords(file.fullPath);
+    latestGlobalInfoRecord = getNewerRecord(latestGlobalInfoRecord, records.latest);
+    latestRateLimitRecord = getNewerRecord(latestRateLimitRecord, records.latestWithValidRateLimits);
+
+    if (targetFile && file.fullPath === targetFile.fullPath) {
+      targetInfoRecord = records.latest;
+    }
+  }
+
+  return {
+    infoRecord: targetInfoRecord ?? latestGlobalInfoRecord,
+    rateLimitRecord: latestRateLimitRecord,
+  };
+}
+
+function decodeJwtPayload(token) {
+  if (typeof token !== "string") {
+    return null;
+  }
+
+  const parts = token.split(".");
+  if (parts.length < 2) {
+    return null;
+  }
+
+  try {
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function readAuthMetadata() {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(authFilePath, "utf8"));
+  } catch {
+    return null;
+  }
+
+  const tokens = parsed?.tokens ?? {};
+  const idPayload = decodeJwtPayload(tokens.id_token);
+  const accessPayload = decodeJwtPayload(tokens.access_token);
+  const accessAuthClaims = accessPayload?.["https://api.openai.com/auth"] ?? {};
+  const idAuthClaims = idPayload?.["https://api.openai.com/auth"] ?? {};
+  const authClaims = {
+    ...idAuthClaims,
+    ...accessAuthClaims,
+  };
+  const profileClaims = accessPayload?.["https://api.openai.com/profile"] ?? {};
+  const organizations = Array.isArray(accessAuthClaims.organizations)
+    ? accessAuthClaims.organizations
+    : Array.isArray(idAuthClaims.organizations)
+      ? idAuthClaims.organizations
+    : [];
+  const defaultOrg =
+    organizations.find((organization) => organization?.is_default) ?? organizations[0] ?? null;
+
+  return {
+    authMode: parsed?.auth_mode ?? null,
+    accountId: tokens.account_id ?? authClaims.chatgpt_account_id ?? null,
+    email: profileClaims.email ?? idPayload?.email ?? null,
+    orgTitle: defaultOrg?.title ?? null,
+    planType: authClaims.chatgpt_plan_type ?? null,
+    subscriptionUntil: authClaims.chatgpt_subscription_active_until ?? null,
+  };
+}
+
+function readConfiguredModel() {
+  let content;
+  try {
+    content = fs.readFileSync(configFilePath, "utf8");
+  } catch {
+    return null;
+  }
+
+  const match = content.match(/^\s*model\s*=\s*["']?([^"'#\n]+)["']?/m);
+  return match?.[1]?.trim() || null;
+}
+
+function clampPercent(value) {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+  if (value < 0) {
+    return 0;
+  }
+  if (value > 100) {
+    return 100;
+  }
+  return value;
+}
+
+function getWindowLabel(windowMinutes, fallbackLabel) {
+  if (windowMinutes === 300) {
+    return "5h";
+  }
+  if (windowMinutes === 10080) {
+    return "week";
+  }
+  return fallbackLabel;
+}
+
+function readCachedLiveRateLimits(maxAgeMs) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(liveRateLimitCachePath, "utf8"));
+  } catch {
+    return null;
+  }
+
+  const cachedAt = parsed?.cachedAt;
+  if (!Number.isFinite(cachedAt) || Date.now() - cachedAt > maxAgeMs) {
+    return null;
+  }
+
+  return normalizeRateLimitSnapshot(parsed?.snapshot ?? null);
+}
+
+function writeCachedLiveRateLimits(snapshot) {
+  try {
+    fs.writeFileSync(
+      liveRateLimitCachePath,
+      `${JSON.stringify({ cachedAt: Date.now(), snapshot })}\n`,
+      "utf8",
+    );
+  } catch {
+    // Ignore cache write failures and continue using live data.
+  }
+}
+
+function requestLiveRateLimits() {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn("codex", ["app-server"], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+
+    let finished = false;
+    let stdoutBuffer = "";
+    let initialized = false;
+
+    const finish = (snapshot, signal = "SIGTERM") => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      clearTimeout(timeoutId);
+      try {
+        child.stdin.end();
+      } catch {
+        // Ignore stdin shutdown failures.
+      }
+      try {
+        if (!child.killed) {
+          child.kill(signal);
+        }
+      } catch {
+        // Ignore shutdown failures.
+      }
+      resolve(snapshot);
+    };
+
+    const timeoutId = setTimeout(() => finish(null, "SIGKILL"), appServerTimeoutMs);
+
+    child.on("error", () => finish(null, "SIGKILL"));
+    child.on("exit", () => finish(null));
+    child.stderr.on("data", () => {
+      // Ignore stderr noise such as PATH warnings from the wrapped codex binary.
+    });
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdoutBuffer += chunk;
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (!line.trim()) {
+          continue;
+        }
+
+        let parsed;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+
+        if (parsed.id === 1 && !initialized) {
+          initialized = true;
+          try {
+            child.stdin.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                method: "notifications/initialized",
+                params: {},
+              })}\n`,
+            );
+            child.stdin.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                method: "account/rateLimits/read",
+              })}\n`,
+            );
+          } catch {
+            finish(null, "SIGKILL");
+          }
+          continue;
+        }
+
+        if (parsed.id === 2) {
+          const snapshot = normalizeRateLimitSnapshot(
+            parsed?.result?.rateLimitsByLimitId?.codex ?? parsed?.result?.rateLimits ?? null,
+          );
+          finish(snapshot);
+          return;
+        }
+      }
+    });
+
+    try {
+      child.stdin.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            clientInfo: {
+              name: "codex-rate-limits",
+              title: "codex-rate-limits",
+              version: "1",
+            },
+            capabilities: null,
+          },
+        })}\n`,
+      );
+    } catch {
+      finish(null, "SIGKILL");
+    }
+  });
+}
+
+async function getLiveRateLimits() {
+  const freshCache = readCachedLiveRateLimits(liveRateLimitFreshMs);
+  if (freshCache) {
+    return freshCache;
+  }
+
+  const liveSnapshot = await requestLiveRateLimits();
+  if (liveSnapshot) {
+    writeCachedLiveRateLimits(liveSnapshot);
+    return liveSnapshot;
+  }
+
+  return readCachedLiveRateLimits(liveRateLimitFallbackMs);
+}
+
+function formatDuration(targetEpochSeconds) {
+  const diffMs = targetEpochSeconds * 1000 - Date.now();
+  if (diffMs <= 0) {
+    return "now";
+  }
+
+  const totalMinutes = Math.floor(diffMs / 60000);
+  const days = Math.floor(totalMinutes / (60 * 24));
+  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+
+  if (days > 0) {
+    parts.push(`${days}d`);
+  }
+  if (hours > 0) {
+    parts.push(`${hours}h`);
+  }
+  if (minutes > 0 && days === 0) {
+    parts.push(`${minutes}m`);
+  }
+  if (parts.length === 0) {
+    parts.push("<1m");
+  }
+
+  return parts.join(" ");
+}
+
+function formatAbsolute(targetEpochSeconds) {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(targetEpochSeconds * 1000));
+}
+
+function formatContextWindow(value) {
+  if (!Number.isFinite(value)) {
+    return "unknown";
+  }
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(1)}k`;
+  }
+  return String(value);
+}
+
+function formatContextUsageShort(used, total) {
+  if (Number.isFinite(used) && Number.isFinite(total)) {
+    return `${formatContextWindow(used)}/${formatContextWindow(total)}`;
+  }
+  if (Number.isFinite(used)) {
+    return formatContextWindow(used);
+  }
+  if (Number.isFinite(total)) {
+    return `?/${formatContextWindow(total)}`;
+  }
+  return "unknown";
+}
+
+function calculateContextUsage(info) {
+  const contextWindow = info?.model_context_window ?? null;
+  const lastRequestTokens = info?.last_token_usage?.total_tokens ?? null;
+  const totalTokens = info?.total_token_usage?.total_tokens ?? null;
+  const usedTokens = Number.isFinite(lastRequestTokens)
+    ? lastRequestTokens
+    : Number.isFinite(totalTokens) && (!Number.isFinite(contextWindow) || totalTokens <= contextWindow)
+      ? totalTokens
+      : null;
+
+  if (!Number.isFinite(contextWindow)) {
+    return {
+      total: null,
+      used: Number.isFinite(usedTokens) ? usedTokens : null,
+      remaining: null,
+    };
+  }
+
+  if (!Number.isFinite(usedTokens)) {
+    return {
+      total: contextWindow,
+      used: null,
+      remaining: null,
+    };
+  }
+
+  return {
+    total: contextWindow,
+    used: usedTokens,
+    remaining: Math.max(0, contextWindow - usedTokens),
+  };
+}
+
+function formatAccountId(accountId) {
+  if (typeof accountId !== "string" || accountId.length === 0) {
+    return "unknown";
+  }
+  if (accountId.length <= 12) {
+    return accountId;
+  }
+  return `${accountId.slice(0, 8)}...${accountId.slice(-4)}`;
+}
+
+function formatAccountSummary(account, planType) {
+  if (account?.email) {
+    return `acct ${account.email}`;
+  }
+  if (account?.accountId) {
+    return `acct ${formatAccountId(account.accountId)}`;
+  }
+  if (planType && planType !== "unknown") {
+    return `plan ${planType}`;
+  }
+  if (account?.authMode) {
+    return `auth ${account.authMode}`;
+  }
+  return "";
+}
+
+function buildWindowSummary(rateLimit, fallbackLabel) {
+  const normalizedRateLimit = normalizeRateLimitWindow(rateLimit);
+  const windowLabel = getWindowLabel(normalizedRateLimit?.window_minutes, fallbackLabel);
+  const resetsAt = normalizedRateLimit?.resets_at ?? null;
+  const isActive = Number.isFinite(resetsAt) && resetsAt > Date.now() / 1000 + 60;
+  const used = isActive ? clampPercent(normalizedRateLimit?.used_percent) : null;
+  const left = used == null ? null : clampPercent(100 - used);
+
+  return {
+    label: windowLabel,
+    used,
+    left,
+    resetsAt,
+    resetsIn: isActive ? formatDuration(resetsAt) : "unknown",
+    resetsAtText: isActive ? formatAbsolute(resetsAt) : "unknown",
+  };
+}
+
+function buildOutput(records, liveRateLimits) {
+  const infoRecord = records.infoRecord ?? records.rateLimitRecord;
+  const rateLimitRecord = records.rateLimitRecord ?? records.infoRecord;
+  const rateLimits = liveRateLimits ?? normalizeRateLimitSnapshot(rateLimitRecord?.rateLimits) ?? {};
+  const primary = buildWindowSummary(rateLimits.primary, "5h");
+  const secondary = buildWindowSummary(rateLimits.secondary, "week");
+  const credits = rateLimits.credits ?? {};
+  const contextUsage = calculateContextUsage(infoRecord?.info ?? {});
+  const account = readAuthMetadata();
+  const planType = rateLimits.plan_type ?? account?.planType ?? "unknown";
+  const modelName = options.modelName ?? readConfiguredModel();
+
+  return {
+    timestamp: infoRecord?.timestamp ?? rateLimitRecord?.timestamp ?? new Date().toISOString(),
+    filePath: infoRecord?.filePath ?? rateLimitRecord?.filePath ?? null,
+    planType,
+    modelName,
+    contextWindow: contextUsage.total,
+    contextUsed: contextUsage.used,
+    contextRemaining: contextUsage.remaining,
+    account: {
+      authMode: account?.authMode ?? null,
+      accountId: account?.accountId ?? null,
+      email: account?.email ?? null,
+      orgTitle: account?.orgTitle ?? null,
+      subscriptionUntil: account?.subscriptionUntil ?? null,
+    },
+    primary,
+    secondary,
+    credits: {
+      hasCredits: Boolean(credits.has_credits),
+      unlimited: Boolean(credits.unlimited),
+      balance: credits.balance ?? null,
+    },
+  };
+}
+
+function renderText(data) {
+  if (options.short) {
+    const accountSummary = formatAccountSummary(data.account, data.planType);
+    const parts = [
+      accountSummary,
+      `${data.primary.label} ${data.primary.left ?? "?"}% left`,
+      `${data.secondary.label} ${data.secondary.left ?? "?"}% left`,
+      `ctx ${formatContextUsageShort(data.contextUsed, data.contextWindow)}`,
+    ].filter(Boolean);
+
+    return parts.join(" | ");
+  }
+
+  const lines = [];
+  lines.push(`Updated: ${data.timestamp}`);
+  if (data.account.email) {
+    lines.push(`Account: ${data.account.email}`);
+  } else if (data.account.accountId) {
+    lines.push(`Account: ${formatAccountId(data.account.accountId)}`);
+  }
+  if (data.account.orgTitle) {
+    lines.push(`Org: ${data.account.orgTitle}`);
+  }
+  lines.push(`Plan: ${data.planType}`);
+  if (data.modelName) {
+    lines.push(`Model: ${data.modelName}`);
+  }
+  if (data.account.subscriptionUntil) {
+    lines.push(`Subscription active until: ${data.account.subscriptionUntil}`);
+  }
+  if (data.contextUsed != null || data.contextWindow != null) {
+    lines.push(
+      `Context: ${formatContextUsageShort(data.contextUsed, data.contextWindow)} used (${formatContextWindow(data.contextRemaining)} left)`,
+    );
+  } else {
+    lines.push(`Context window: ${formatContextWindow(data.contextWindow)}`);
+  }
+  lines.push(
+    `${data.primary.label}: ${data.primary.left ?? "?"}% left (${data.primary.used ?? "?"}% used), resets in ${data.primary.resetsIn} at ${data.primary.resetsAtText}`,
+  );
+  lines.push(
+    `${data.secondary.label}: ${data.secondary.left ?? "?"}% left (${data.secondary.used ?? "?"}% used), resets in ${data.secondary.resetsIn} at ${data.secondary.resetsAtText}`,
+  );
+  if (data.credits.unlimited) {
+    lines.push("Credits: unlimited");
+  } else if (data.credits.hasCredits || data.credits.balance != null) {
+    lines.push(`Credits balance: ${data.credits.balance ?? "available"}`);
+  } else {
+    lines.push("Credits: none");
+  }
+  return lines.join("\n");
+}
+
+async function printSnapshot() {
+  const latestRecords = findLatestRecords();
+  const liveRateLimits = await getLiveRateLimits();
+  if (!latestRecords.infoRecord && !latestRecords.rateLimitRecord && !liveRateLimits) {
+    console.error(`No token_count events found under ${sessionsRoot}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const output = buildOutput(latestRecords, liveRateLimits);
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+    return;
+  }
+
+  process.stdout.write(`${renderText(output)}\n`);
+}
+
+async function main() {
+  if (options.watchSeconds == null) {
+    await printSnapshot();
+    return;
+  }
+
+  let rendering = false;
+  const renderLoop = async () => {
+    if (rendering) {
+      return;
+    }
+    rendering = true;
+    process.stdout.write("\x1Bc");
+    await printSnapshot();
+    rendering = false;
+  };
+
+  await renderLoop();
+  setInterval(() => {
+    void renderLoop();
+  }, options.watchSeconds * 1000);
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+});

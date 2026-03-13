@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+sentinel=""
+model_name=""
+cwd=""
+watch_seconds="${CODEX_STATUS_WATCH_SECONDS:-5}"
+rate_limits_bin="$HOME/.codex/bin/codex-rate-limits"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --sentinel)
+      sentinel="${2:-}"
+      shift 2
+      ;;
+    --model-name)
+      model_name="${2:-}"
+      shift 2
+      ;;
+    --cwd)
+      cwd="${2:-}"
+      shift 2
+      ;;
+    --watch-seconds)
+      watch_seconds="${2:-}"
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$sentinel" ]]; then
+  echo "Missing required --sentinel argument" >&2
+  exit 1
+fi
+
+render_status() {
+  local rate_limit_args=(
+    "$rate_limits_bin"
+    "--short"
+  )
+
+  if [[ -n "$cwd" ]]; then
+    rate_limit_args+=("--cwd" "$cwd")
+  fi
+  printf '\033[2J\033[H'
+  if [[ -n "$model_name" ]]; then
+    rate_limit_args+=("--model-name" "$model_name")
+    "${rate_limit_args[@]}" 2>/dev/null || printf 'status unavailable\n'
+  else
+    "${rate_limit_args[@]}" 2>/dev/null || printf 'status unavailable\n'
+  fi
+}
+
+next_render_at=0
+
+while [[ -e "$sentinel" ]]; do
+  now="$(date '+%s')"
+  if (( now >= next_render_at )); then
+    render_status
+    next_render_at=$((now + watch_seconds))
+  fi
+  sleep 1 || break
+done
