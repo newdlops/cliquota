@@ -70,9 +70,41 @@ require_binary() {
     fi
 }
 
+ensure_tmux() {
+    if command -v tmux >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        log "tmux not found. attempting to install via homebrew for macOS..."
+
+        local brew_exe=""
+        if [[ "$(uname -m)" == "arm64" ]] && [[ -x "/opt/homebrew/bin/brew" ]]; then
+            brew_exe="/opt/homebrew/bin/brew"
+        elif [[ -x "/usr/local/bin/brew" ]]; then
+            brew_exe="/usr/local/bin/brew"
+        elif command -v brew >/dev/null 2>&1; then
+            brew_exe=$(command -v brew)
+        fi
+
+        if [[ -n "$brew_exe" ]]; then
+            log "using homebrew: $brew_exe"
+            "$brew_exe" install tmux
+        else
+            log "homebrew not found. please install homebrew first: https://brew.sh"
+            exit 1
+        fi
+    else
+        log "tmux not found. please install tmux manually."
+        exit 1
+    fi
+}
+
+ensure_tmux
 require_binary install
 require_binary awk
 require_binary python3
+require_binary tmux
 
 install_file "$PAYLOAD_DIR/.gemini/tmux_status.py" "$HOME/.gemini/tmux_status.py" 0644
 install_file "$PAYLOAD_DIR/.codex/bin/codex-rate-limits" "$HOME/.codex/bin/codex-rate-limits" 0755
